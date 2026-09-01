@@ -16,7 +16,7 @@ on:
         required: true
         default: 'pihu-wif-testing-audit-reports'
       poll_interval_seconds:
-        description: 'Polling Interval in Seconds (900 = 15 min)'
+        description: 'Polling Interval in Seconds (e.g. 900 for 15 min, 60 for testing)'
         required: true
         default: '900'
       max_poll_iterations:
@@ -46,7 +46,7 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: 1. Trigger GenerateAuditReport (NIST_800_53_R4)
+      - name: 1. Trigger GenerateAuditReport
         id: trigger
         run: |
           PROJECT_ID="pihu-wif-testing"
@@ -57,7 +57,7 @@ jobs:
           echo "Fetching initial short-lived access token..."
           ACCESS_TOKEN=$(gcloud auth print-access-token)
 
-          echo "Submitting GenerateAuditReport for framework $FRAMEWORK..."
+          echo "Submitting GenerateAuditReport for $FRAMEWORK..."
           
           GENERATE_RESPONSE=$(curl -s -X POST \
             "https://auditmanager.googleapis.com/v1/projects/${PROJECT_ID}/locations/${LOCATION}/auditReports:generate" \
@@ -73,61 +73,58 @@ jobs:
           echo "Response received:"
           echo "$GENERATE_RESPONSE" | jq . || echo "$GENERATE_RESPONSE"
 
-          # Extract Operation Name
-          OPERATION_NAME=$(echo "$GENERATE_RESPONSE" | jq -r '.name // empty')
+          # Wait a couple seconds and get the newly created Audit Report resource name
+          sleep 3
+          LATEST_REPORT_NAME=$(curl -s -X GET \
+            "https://auditmanager.googleapis.com/v1/projects/${PROJECT_ID}/locations/${LOCATION}/auditReports" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" | jq -r '.auditReports[0].name // empty')
 
-          if [ -z "$OPERATION_NAME" ]; then
-            echo "ERROR: Failed to start Long Running Operation."
+          if [ -z "$LATEST_REPORT_NAME" ]; then
+            echo "ERROR: Failed to find created Audit Report."
             exit 1
           fi
 
-          echo "OPERATION_NAME=$OPERATION_NAME" >> $GITHUB_ENV
-          echo "Successfully started LRO: $OPERATION_NAME"
+          echo "LATEST_REPORT_NAME=$LATEST_REPORT_NAME" >> $GITHUB_ENV
+          echo "Successfully tracking Audit Report: $LATEST_REPORT_NAME"
 
-      - name: 2. Poll GetOperation Every 15 Minutes
+      - name: 2. Poll GetAuditReport Every 15 Minutes
         run: |
           POLL_INTERVAL="${{ github.event.inputs.poll_interval_seconds || '900' }}"
           MAX_ITERATIONS="${{ github.event.inputs.max_poll_iterations || '24' }}"
           BUCKET_NAME="${{ github.event.inputs.bucket_name || 'pihu-wif-testing-audit-reports' }}"
-          
-          # Convert /operations/ to /operationDetails/ for the Audit Manager REST route
-          POLL_PATH=$(echo "$OPERATION_NAME" | sed 's|/operations/|/operationDetails/|')
+          REPORT_NAME="$LATEST_REPORT_NAME"
 
-          echo "Starting polling loop for: $POLL_PATH"
+          echo "Starting polling loop for: $REPORT_NAME"
           echo "Polling every $POLL_INTERVAL seconds up to $MAX_ITERATIONS times..."
 
           for ((i=1; i<=MAX_ITERATIONS; i++)); do
             echo "=========================================="
             echo "Poll Attempt #$i at $(date -u)"
 
-            # Refresh token dynamically on each iteration via WIF
+            # Refresh short-lived token dynamically on each iteration via WIF
             CURRENT_TOKEN=$(gcloud auth print-access-token)
 
             STATUS_RESPONSE=$(curl -s -X GET \
-              "https://auditmanager.googleapis.com/v1/${POLL_PATH}" \
+              "https://auditmanager.googleapis.com/v1/${REPORT_NAME}" \
               -H "Authorization: Bearer ${CURRENT_TOKEN}")
 
             echo "Status Response:"
             echo "$STATUS_RESPONSE" | jq . || echo "$STATUS_RESPONSE"
 
-            IS_DONE=$(echo "$STATUS_RESPONSE" | jq -r '.done // false')
+            STATE=$(echo "$STATUS_RESPONSE" | jq -r '.reportGenerationState // empty')
 
-            if [ "$IS_DONE" = "true" ]; then
-              echo "🎉 NIST_800_53_R4 Audit Report generation is COMPLETE!"
-              
-              OP_ERROR=$(echo "$STATUS_RESPONSE" | jq -r '.error // empty')
-              if [ -n "$OP_ERROR" ]; then
-                echo "Operation finished with error:"
-                echo "$STATUS_RESPONSE" | jq '.error'
-                exit 1
-              fi
+            if [ "$STATE" = "COMPLETED" ]; then
+              echo "🎉 Audit Report generation is COMPLETE!"
 
               echo "Listing generated reports and evidence files in gs://$BUCKET_NAME..."
               gcloud storage ls "gs://${BUCKET_NAME}/**" || true
               exit 0
+            elif [ "$STATE" = "FAILED" ]; then
+              echo "❌ Audit Report generation failed."
+              exit 1
             fi
 
-            echo "Audit still running (done: false). Sleeping for $POLL_INTERVAL seconds..."
+            echo "Current state: $STATE (IN_PROGRESS). Sleeping for $POLL_INTERVAL seconds..."
             sleep "$POLL_INTERVAL"
           done
 
