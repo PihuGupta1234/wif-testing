@@ -1,0 +1,75 @@
+name: Audit Manager Project Enrollment via WIF
+
+on:
+  workflow_dispatch: # Allows manual trigger with optional inputs
+    inputs:
+      location:
+        description: 'GCP Region / Location'
+        required: true
+        default: 'global'
+      bucket_name:
+        description: 'GCS Destination Bucket'
+        required: true
+        default: 'pihu-wif-testing-audit-reports'
+
+permissions:
+  id-token: write # Required for WIF OIDC
+  contents: read
+
+jobs:
+  enroll-audit-manager:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/732151768854/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'wif-testing@pihu-wif-testing.iam.gserviceaccount.com'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: 1. Enroll Project in Audit Manager
+        run: |
+          LOCATION="${{ github.event.inputs.location || 'global' }}"
+          BUCKET_NAME="${{ github.event.inputs.bucket_name || 'pihu-wif-testing-audit-reports' }}"
+          PROJECT_ID="pihu-wif-testing"
+
+          echo "Fetching short-lived access token..."
+          ACCESS_TOKEN=$(gcloud auth print-access-token)
+
+          echo "Calling Audit Manager EnrollResource API for project $PROJECT_ID..."
+          
+          ENROLL_RESPONSE=$(curl -s -X POST \
+            "https://auditmanager.googleapis.com/v1/projects/${PROJECT_ID}/locations/${LOCATION}:enrollResource" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"scope\": \"projects/${PROJECT_ID}/locations/${LOCATION}\",
+              \"destinations\": [
+                {
+                  \"eligibleGcsBucket\": \"gs://${BUCKET_NAME}\"
+                }
+              ]
+            }")
+
+          echo "Enrollment Response:"
+          echo "$ENROLL_RESPONSE" | jq . || echo "$ENROLL_RESPONSE"
+
+      - name: 2. Verify Resource Enrollment Status
+        run: |
+          LOCATION="${{ github.event.inputs.location || 'global' }}"
+          PROJECT_ID="pihu-wif-testing"
+          ACCESS_TOKEN=$(gcloud auth print-access-token)
+
+          echo "Checking Enrollment Status..."
+          STATUS_RESPONSE=$(curl -s -X GET \
+            "https://auditmanager.googleapis.com/v1/projects/${PROJECT_ID}/locations/${LOCATION}/resourceEnrollmentStatuses/${PROJECT_ID}" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}")
+
+          echo "Enrollment Status Response:"
+          echo "$STATUS_RESPONSE" | jq . || echo "$STATUS_RESPONSE"
