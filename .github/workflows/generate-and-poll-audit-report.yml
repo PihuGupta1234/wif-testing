@@ -1,0 +1,134 @@
+name: Generate Audit Report & Poll LRO via WIF
+
+on:
+  workflow_dispatch:
+    inputs:
+      compliance_framework:
+        description: 'Compliance Framework'
+        required: true
+        default: 'NIST_800_53_R4'
+      location:
+        description: 'GCP Region / Location'
+        required: true
+        default: 'global'
+      bucket_name:
+        description: 'GCS Destination Bucket'
+        required: true
+        default: 'pihu-wif-testing-audit-reports'
+      poll_interval_seconds:
+        description: 'Polling Interval in Seconds (900 = 15 min)'
+        required: true
+        default: '900'
+      max_poll_iterations:
+        description: 'Max Polling Iterations (e.g., 24 for 6 hours)'
+        required: true
+        default: '24'
+
+permissions:
+  id-token: write # Required for WIF OIDC
+  contents: read
+
+jobs:
+  audit-manager-lro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # Max single GitHub Actions runner timeout (6 hours)
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/732151768854/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'wif-testing@pihu-wif-testing.iam.gserviceaccount.com'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: 1. Trigger GenerateAuditReport (NIST_800_53_R4)
+        id: trigger
+        run: |
+          PROJECT_ID="pihu-wif-testing"
+          LOCATION="${{ github.event.inputs.location || 'global' }}"
+          BUCKET_NAME="${{ github.event.inputs.bucket_name || 'pihu-wif-testing-audit-reports' }}"
+          FRAMEWORK="${{ github.event.inputs.compliance_framework || 'NIST_800_53_R4' }}"
+
+          echo "Fetching initial short-lived access token..."
+          ACCESS_TOKEN=$(gcloud auth print-access-token)
+
+          echo "Submitting GenerateAuditReport for framework $FRAMEWORK..."
+          
+          GENERATE_RESPONSE=$(curl -s -X POST \
+            "https://auditmanager.googleapis.com/v1/projects/${PROJECT_ID}/locations/${LOCATION}/auditReports:generate" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"scope\": \"projects/${PROJECT_ID}/locations/${LOCATION}\",
+              \"gcs_uri\": \"gs://${BUCKET_NAME}\",
+              \"report_format\": \"AUDIT_REPORT_FORMAT_ODF\",
+              \"compliance_framework\": \"${FRAMEWORK}\"
+            }")
+
+          echo "Response received:"
+          echo "$GENERATE_RESPONSE" | jq . || echo "$GENERATE_RESPONSE"
+
+          # Extract Operation Name from LRO response
+          OPERATION_NAME=$(echo "$GENERATE_RESPONSE" | jq -r '.name // empty')
+
+          if [ -z "$OPERATION_NAME" ]; then
+            echo "ERROR: Failed to start Long Running Operation."
+            exit 1
+          fi
+
+          echo "OPERATION_NAME=$OPERATION_NAME" >> $GITHUB_ENV
+          echo "Successfully started LRO: $OPERATION_NAME"
+
+      - name: 2. Poll GetOperation Every 15 Minutes
+        run: |
+          POLL_INTERVAL="${{ github.event.inputs.poll_interval_seconds || '900' }}"
+          MAX_ITERATIONS="${{ github.event.inputs.max_poll_iterations || '24' }}"
+          BUCKET_NAME="${{ github.event.inputs.bucket_name || 'pihu-wif-testing-audit-reports' }}"
+          OPERATION_NAME="$OPERATION_NAME"
+
+          echo "Starting polling loop for operation: $OPERATION_NAME"
+          echo "Polling every $POLL_INTERVAL seconds up to $MAX_ITERATIONS times..."
+
+          for ((i=1; i<=MAX_ITERATIONS; i++)); do
+            echo "=========================================="
+            echo "Poll Attempt #$i at $(date -u)"
+
+            # Refresh token dynamically on each iteration via WIF
+            CURRENT_TOKEN=$(gcloud auth print-access-token)
+
+            STATUS_RESPONSE=$(curl -s -X GET \
+              "https://auditmanager.googleapis.com/v1/${OPERATION_NAME}" \
+              -H "Authorization: Bearer ${CURRENT_TOKEN}")
+
+            echo "Status Response:"
+            echo "$STATUS_RESPONSE" | jq . || echo "$STATUS_RESPONSE"
+
+            IS_DONE=$(echo "$STATUS_RESPONSE" | jq -r '.done // false')
+
+            if [ "$IS_DONE" = "true" ]; then
+              echo "🎉 NIST_800_53_R4 Audit Report generation is COMPLETE!"
+              
+              OP_ERROR=$(echo "$STATUS_RESPONSE" | jq -r '.error // empty')
+              if [ -n "$OP_ERROR" ]; then
+                echo "Operation finished with error:"
+                echo "$STATUS_RESPONSE" | jq '.error'
+                exit 1
+              fi
+
+              echo "Listing generated reports and evidence files in gs://$BUCKET_NAME..."
+              gcloud storage ls "gs://${BUCKET_NAME}/**" || true
+              exit 0
+            fi
+
+            echo "Audit still running (done: false). Sleeping for $POLL_INTERVAL seconds..."
+            sleep "$POLL_INTERVAL"
+          done
+
+          echo "Reached maximum poll iterations ($MAX_ITERATIONS)."
+          echo "Check status at any time using:"
+          echo "curl -H \"Authorization: Bearer \$(gcloud auth print-access-token)\" https://auditmanager.googleapis.com/v1/${OPERATION_NAME}"
