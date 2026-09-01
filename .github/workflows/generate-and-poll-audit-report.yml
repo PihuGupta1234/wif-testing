@@ -20,7 +20,7 @@ on:
         required: true
         default: '900'
       max_poll_iterations:
-        description: 'Max Polling Iterations (e.g., 24 for 6 hours)'
+        description: 'Max Polling Iterations (e.g. 24 for 6 hours)'
         required: true
         default: '24'
 
@@ -73,7 +73,7 @@ jobs:
           echo "Response received:"
           echo "$GENERATE_RESPONSE" | jq . || echo "$GENERATE_RESPONSE"
 
-          # Extract Operation Name from LRO response
+          # Extract Operation Name
           OPERATION_NAME=$(echo "$GENERATE_RESPONSE" | jq -r '.name // empty')
 
           if [ -z "$OPERATION_NAME" ]; then
@@ -89,9 +89,11 @@ jobs:
           POLL_INTERVAL="${{ github.event.inputs.poll_interval_seconds || '900' }}"
           MAX_ITERATIONS="${{ github.event.inputs.max_poll_iterations || '24' }}"
           BUCKET_NAME="${{ github.event.inputs.bucket_name || 'pihu-wif-testing-audit-reports' }}"
-          OPERATION_NAME="$OPERATION_NAME"
+          
+          # Convert /operations/ to /operationDetails/ for the Audit Manager REST route
+          POLL_PATH=$(echo "$OPERATION_NAME" | sed 's|/operations/|/operationDetails/|')
 
-          echo "Starting polling loop for operation: $OPERATION_NAME"
+          echo "Starting polling loop for: $POLL_PATH"
           echo "Polling every $POLL_INTERVAL seconds up to $MAX_ITERATIONS times..."
 
           for ((i=1; i<=MAX_ITERATIONS; i++)); do
@@ -102,7 +104,7 @@ jobs:
             CURRENT_TOKEN=$(gcloud auth print-access-token)
 
             STATUS_RESPONSE=$(curl -s -X GET \
-              "https://auditmanager.googleapis.com/v1/${OPERATION_NAME}" \
+              "https://auditmanager.googleapis.com/v1/${POLL_PATH}" \
               -H "Authorization: Bearer ${CURRENT_TOKEN}")
 
             echo "Status Response:"
@@ -130,5 +132,3 @@ jobs:
           done
 
           echo "Reached maximum poll iterations ($MAX_ITERATIONS)."
-          echo "Check status at any time using:"
-          echo "curl -H \"Authorization: Bearer \$(gcloud auth print-access-token)\" https://auditmanager.googleapis.com/v1/${OPERATION_NAME}"
